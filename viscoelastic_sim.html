@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Discrete Viscoelastic Model Simulation</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f9f9f9; }
+        .container { display: flex; max-width: 1200px; margin: auto; }
+        .sidebar { width: 250px; padding: 20px; background-color: #e9e9e9; border-right: 1px solid #ccc; }
+        .main { flex-grow: 1; padding: 20px; }
+        .model-graphic { height: 300px; border: 1px solid #ccc; margin-bottom: 20px; text-align: center; position: relative; }
+        .graphs { display: flex; flex-wrap: wrap; justify-content: space-between; }
+        .graph { width: 48%; }
+        label { display: block; margin: 10px 0 5px; font-size: 14px; }
+        input, select { width: 100%; padding: 6px; box-sizing: border-box; font-size: 14px; }
+        button { width: 48%; padding: 10px; background-color: #007bff; color: white; border: none; cursor: pointer; margin-top: 15px; }
+        button:hover { background-color: #0056b3; }
+        #pauseBtn { background-color: #ffc107; color: black; }
+        #pauseBtn:hover { background-color: #e0a800; }
+        #downloadBtn { width: auto; margin: 20px auto; display: block; }
+        .btn-group { display: flex; justify-content: space-between; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <h2>Settings</h2>
+            <label for="element">Model:</label>
+            <select id="element">
+                <option value="spring">Spring (Elastic)</option>
+                <option value="dashpot">Dashpot (Viscous)</option>
+                <option value="spring-series">Two Springs in Series</option>
+                <option value="spring-parallel">Two Springs in Parallel</option>
+                <option value="maxwell">Maxwell (Spring + Dashpot Series)</option>
+                <option value="kelvin-voigt">Kelvin-Voigt (Spring + Dashpot Parallel)</option>
+                <option value="sls">Standard Linear Solid (Spring + Kelvin-Voigt Series)</option>
+            </select>
+            <div id="paramContainer"></div>
+            <label for="inputType">Input Type:</label>
+            <select id="inputType">
+                <option value="force">Force-Controlled</option>
+                <option value="deformation">Deformation-Controlled</option>
+            </select>
+            
+            <label for="waveform">Waveform:</label>
+            <select id="waveform">
+                <option value="step">Step Change</option>
+                <option value="ramp">Constant Rate Ramp</option>
+                <option value="sine">Cyclic (Sine)</option>
+            </select>
+            
+            <div id="extraParams"></div>
+            
+            <label id="inputLabel" for="inputValue">Input Force F0 (N):</label>
+            <input type="number" id="inputValue" value="5" step="0.1" min="0">
+            
+            <label for="timeDuration">Duration (s):</label>
+            <input type="number" id="timeDuration" value="10" step="0.1" min="0.1">
+            
+            <div class="btn-group">
+                <button id="runBtn" onclick="runSimulation()">Run Simulation</button>
+                <button id="pauseBtn" onclick="togglePause()" style="display:none;">Pause</button>
+            </div>
+        </div>
+        <div class="main">
+            <h1>Tissue Mechanics Simulation</h1>
+            <p>Explore viscoelastic models for ligaments/tendons with dynamic inputs and animation.</p>
+            <div class="model-graphic">
+                <canvas id="modelCanvas" width="800" height="300"></canvas>
+            </div>
+            <div class="graphs">
+                <div class="graph">
+                    <canvas id="timeChart"></canvas>
+                </div>
+                <div class="graph">
+                    <canvas id="fdChart"></canvas>
+                </div>
+            </div>
+            <button id="downloadBtn" onclick="downloadCSV()" style="display:none;">Download Data as CSV</button>
+        </div>
+    </div>
+
+    <script>
+        let timeChart, fdChart, animationTimeout, isPaused = false, currentIndex = 0;
+        let times = [], deformations = [], forces = [], internalStates = [];
+
+        function initCharts() {
+            const timeCtx = document.getElementById('timeChart').getContext('2d');
+            timeChart = new Chart(timeCtx, {
+                type: 'line',
+                data: { datasets: [
+                    { label: 'Deformation (mm)', borderColor: 'blue', data: [] },
+                    { label: 'Force (N)', borderColor: 'red', data: [] }
+                ] },
+                options: { 
+                    scales: { 
+                        x: { 
+                            type: 'linear', 
+                            position: 'bottom', 
+                            title: { display: true, text: 'Time (s)' },
+                            ticks: { autoSkip: true, maxTicksLimit: 10 }
+                        }, 
+                        y: { title: { display: true, text: 'Value' } } 
+                    } 
+                }
+            });
+
+            const fdCtx = document.getElementById('fdChart').getContext('2d');
+            fdChart = new Chart(fdCtx, {
+                type: 'line',
+                data: { datasets: [{ label: 'Force vs Deformation', borderColor: 'green', data: [] }] },
+                options: { 
+                    scales: { 
+                        x: { 
+                            type: 'linear', 
+                            position: 'bottom', 
+                            title: { display: true, text: 'Deformation (mm)' },
+                            ticks: { autoSkip: true, maxTicksLimit: 10 }
+                        }, 
+                        y: { title: { display: true, text: 'Force (N)' } } 
+                    } 
+                }
+            });
+        }
+
+        function updateLabels() {
+            const inputType = document.getElementById('inputType').value;
+            const waveform = document.getElementById('waveform').value;
+            let inputText = inputType === 'force' ? 'Force ' : 'Deformation ';
+            let unit = inputType === 'force' ? ' (N)' : ' (mm)';
+            let desc = '';
+            switch (waveform) {
+                case 'step': desc = 'Constant Value'; break;
+                case 'ramp': desc = 'Target Value'; break;
+                case 'sine': desc = 'Amplitude'; break;
+            }
+            document.getElementById('inputLabel').textContent = `Input ${inputText}${desc}${unit}:`;
+        }
+
+        function updateParamContainer() {
+            const paramContainer = document.getElementById('paramContainer');
+            paramContainer.innerHTML = '';
+            const element = document.getElementById('element').value;
+            if (element === 'spring' || element === 'dashpot') {
+                if (element === 'spring') {
+                    paramContainer.innerHTML += '<label for="k">Stiffness k (N/mm):</label><input type="number" id="k" value="10" step="0.1" min="0.1">';
+                } else {
+                    paramContainer.innerHTML += '<label for="eta">Viscosity η (N·s/mm):</label><input type="number" id="eta" value="10" step="0.1" min="0.1">';
+                }
+                paramContainer.innerHTML += '<label for="engagement">Engagement Def. (mm):</label><input type="number" id="engagement" value="0" step="0.01" min="0">';
+                paramContainer.innerHTML += '<label for="rest">Rest Length (mm):</label><input type="number" id="rest" value="10" step="0.1" min="0.1">';
+            } else if (element === 'spring-parallel') {
+                paramContainer.innerHTML += '<label>Spring 1</label>';
+                paramContainer.innerHTML += '<label for="k1">Stiffness k1 (N/mm):</label><input type="number" id="k1" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="engagement1">Engagement Def.1 (mm):</label><input type="number" id="engagement1" value="0" step="0.01" min="0">';
+                paramContainer.innerHTML += '<label for="rest1">Rest Length1 (mm):</label><input type="number" id="rest1" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label>Spring 2</label>';
+                paramContainer.innerHTML += '<label for="k2">Stiffness k2 (N/mm):</label><input type="number" id="k2" value="20" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="engagement2">Engagement Def.2 (mm):</label><input type="number" id="engagement2" value="5" step="0.01" min="0">';
+                paramContainer.innerHTML += '<label for="rest2">Rest Length2 (mm):</label><input type="number" id="rest2" value="10" step="0.1" min="0.1">';
+            } else if (element === 'spring-series') {
+                paramContainer.innerHTML += '<label>Spring 1</label>';
+                paramContainer.innerHTML += '<label for="k1">Stiffness k1 (N/mm):</label><input type="number" id="k1" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="rest1">Rest Length1 (mm):</label><input type="number" id="rest1" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label>Spring 2</label>';
+                paramContainer.innerHTML += '<label for="k2">Stiffness k2 (N/mm):</label><input type="number" id="k2" value="20" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="rest2">Rest Length2 (mm):</label><input type="number" id="rest2" value="10" step="0.1" min="0.1">';
+            } else if (element === 'maxwell' || element === 'kelvin-voigt') {
+                paramContainer.innerHTML += '<label>Spring</label>';
+                paramContainer.innerHTML += '<label for="k">Stiffness k (N/mm):</label><input type="number" id="k" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="rest_s">Rest Length Spring (mm):</label><input type="number" id="rest_s" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label>Dashpot</label>';
+                paramContainer.innerHTML += '<label for="eta">Viscosity η (N·s/mm):</label><input type="number" id="eta" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="rest_d">Rest Length Dashpot (mm):</label><input type="number" id="rest_d" value="10" step="0.1" min="0.1">';
+            } else if (element === 'sls') {
+                paramContainer.innerHTML += '<label>Main Spring</label>';
+                paramContainer.innerHTML += '<label for="k1">Stiffness k1 (N/mm):</label><input type="number" id="k1" value="5" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="rest1">Rest Length1 (mm):</label><input type="number" id="rest1" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label>KV Spring</label>';
+                paramContainer.innerHTML += '<label for="k2">Stiffness k2 (N/mm):</label><input type="number" id="k2" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="rest2">Rest Length2 (mm):</label><input type="number" id="rest2" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label>KV Dashpot</label>';
+                paramContainer.innerHTML += '<label for="eta">Viscosity η (N·s/mm):</label><input type="number" id="eta" value="10" step="0.1" min="0.1">';
+                paramContainer.innerHTML += '<label for="rest_d">Rest Length Dashpot (mm):</label><input type="number" id="rest_d" value="10" step="0.1" min="0.1">';
+            }
+        }
+
+        function updateExtraParams() {
+            const extra = document.getElementById('extraParams');
+            extra.innerHTML = '';
+            const waveform = document.getElementById('waveform').value;
+            if (waveform === 'sine') {
+                extra.innerHTML = '<label for="frequency">Frequency (Hz):</label><input type="number" id="frequency" value="0.5" step="0.01" min="0.01">';
+            }
+            updateLabels();
+        }
+
+        function getInput(t, waveform, inputVal, T, frequency) {
+            switch (waveform) {
+                case 'step':
+                    return t > 0 ? inputVal : 0;
+                case 'ramp':
+                    return inputVal * (t / T);
+                case 'sine':
+                    return inputVal * Math.sin(2 * Math.PI * frequency * t);
+            }
+        }
+
+        function drawSingleElement(ctx, type, startX, y, engagement, rest, effectiveDef, scale) {
+            effectiveDef = Math.max(0, effectiveDef);
+            let baseLength = rest * scale;
+            let modelLength = baseLength + effectiveDef * scale;
+            let modelStart = startX + (engagement || 0) * scale;
+
+            // Slack
+            if (engagement > 0) {
+                ctx.beginPath();
+                ctx.moveTo(startX, y);
+                ctx.lineTo(modelStart, y);
+                ctx.setLineDash([5, 5]);
+                ctx.strokeStyle = '#aaa';
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+
+            if (type === 'spring') {
+                ctx.beginPath();
+                ctx.moveTo(modelStart, y);
+                const coils = 8;
+                const coilWidth = modelLength / coils;
+                ctx.strokeStyle = '#007bff';
+                ctx.lineWidth = 2;
+                for (let i = 0; i < coils; i++) {
+                    ctx.lineTo(modelStart + coilWidth * i + coilWidth / 2, y + (i % 2 ? -15 : 15));
+                    ctx.lineTo(modelStart + coilWidth * (i + 1), y);
+                }
+                ctx.stroke();
+            } else { // dashpot
+                ctx.strokeStyle = '#28a745';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(modelStart, y - 20, baseLength, 40);
+                ctx.beginPath();
+                ctx.moveTo(modelStart + baseLength, y);
+                ctx.lineTo(modelStart + baseLength + effectiveDef * scale, y);
+                ctx.stroke();
+                ctx.fillRect(modelStart + baseLength + effectiveDef * scale - 10, y - 30, 10, 60);
+            }
+            return modelStart + modelLength;
+        }
+
+        function drawModel(element, currentDef, currentForce, inputType, params, internalState) {
+            const ctx = document.getElementById('modelCanvas').getContext('2d');
+            ctx.clearRect(0, 0, 800, 300);
+            const scale = 20;
+            let label = inputType === 'force' ? `F = ${currentForce.toFixed(2)} N` : `δ = ${currentDef.toFixed(2)} mm`;
+
+            // Left fixed end
+            ctx.fillStyle = '#333';
+            ctx.fillRect(50, 130, 20, 20);
+
+            let rightX = 70;
+            let engagement = 0;
+            if (element === 'spring' || element === 'dashpot') {
+                engagement = params.engagement || 0;
+                const rest = params.rest;
+                const effectiveDef = Math.max(0, currentDef - engagement);
+                rightX = drawSingleElement(ctx, element, 70, 140, engagement, rest, effectiveDef, scale);
+            } else if (element === 'spring-parallel') {
+                const {k1, k2, engagement1, engagement2, rest1, rest2} = params;
+                // Upper spring
+                const effective1 = Math.max(0, currentDef - engagement1);
+                drawSingleElement(ctx, 'spring', 70, 100, engagement1, rest1, effective1, scale);
+                // Lower spring
+                const effective2 = Math.max(0, currentDef - engagement2);
+                drawSingleElement(ctx, 'spring', 70, 180, engagement2, rest2, effective2, scale);
+                // Connect ends
+                ctx.beginPath();
+                ctx.moveTo(70, 100);
+                ctx.lineTo(70, 180);
+                ctx.moveTo(70 + (engagement1 + rest1 + effective1) * scale, 100);
+                ctx.lineTo(70 + (engagement1 + rest1 + effective1) * scale, 180);
+                ctx.strokeStyle = '#333';
+                ctx.lineWidth = 3;
+                ctx.stroke();
+                rightX = 70 + (engagement1 + rest1 + effective1) * scale;
+            } else if (element === 'spring-series') {
+                const {rest1, rest2} = params;
+                const [def1, def2] = internalState || [currentDef / 2, currentDef / 2];
+                rightX = drawSingleElement(ctx, 'spring', 70, 140, 0, rest1, def1, scale);
+                // Display node
+                ctx.beginPath();
+                ctx.arc(rightX, 140, 5, 0, 2 * Math.PI);
+                ctx.fillStyle = '#ff0000';
+                ctx.fill();
+                rightX = drawSingleElement(ctx, 'spring', rightX, 140, 0, rest2, def2, scale);
+            } else if (element === 'maxwell') {
+                const {rest_s, rest_d} = params;
+                const [def_s, def_d] = internalState || [currentDef / 2, currentDef / 2];
+                rightX = drawSingleElement(ctx, 'spring', 70, 140, 0, rest_s, def_s, scale);
+                rightX = drawSingleElement(ctx, 'dashpot', rightX, 140, 0, rest_d, def_d, scale);
+            } else if (element === 'kelvin-voigt') {
+                const {rest_s, rest_d} = params;
+                drawSingleElement(ctx, 'spring', 70, 100, 0, rest_s, currentDef, scale);
+                drawSingleElement(ctx, 'dashpot', 70, 180, 0, rest_d, currentDef, scale);
+                // Connect
+                ctx.beginPath();
+                ctx.moveTo(70, 100);
+                ctx.lineTo(70, 180);
+                ctx.moveTo(70 + (rest_s + currentDef) * scale, 100);
+                ctx.lineTo(70 + (rest_s + currentDef) * scale, 180);
+                ctx.strokeStyle = '#333';
+                ctx.lineWidth = 3;
+                ctx.stroke();
+                rightX = 70 + (rest_s + currentDef) * scale;
+            } else if (element === 'sls') {
+                const {rest1, rest2, rest_d} = params;
+                const [def1, def_kv] = internalState || [currentDef / 2, currentDef / 2];
+                rightX = drawSingleElement(ctx, 'spring', 70, 140, 0, rest1, def1, scale);
+                const kvStart = rightX;
+                drawSingleElement(ctx, 'spring', kvStart, 100, 0, rest2, def_kv, scale);
+                drawSingleElement(ctx, 'dashpot', kvStart, 180, 0, rest_d, def_kv, scale);
+                // Connect KV
+                ctx.beginPath();
+                ctx.moveTo(kvStart, 100);
+                ctx.lineTo(kvStart, 180);
+                ctx.moveTo(kvStart + (rest2 + def_kv) * scale, 100);
+                ctx.lineTo(kvStart + (rest2 + def_kv) * scale, 180);
+                ctx.strokeStyle = '#333';
+                ctx.lineWidth = 3;
+                ctx.stroke();
+                rightX = kvStart + (rest2 + def_kv) * scale;
+            }
+
+            // Right load end
+            ctx.fillStyle = '#333';
+            ctx.fillRect(rightX, 130, 20, 20);
+
+            // Labels
+            ctx.fillStyle = '#000';
+            ctx.font = '14px Arial';
+            ctx.fillText('Load', rightX + 25, 145);
+            ctx.fillText(label, rightX + 25, 130);
+        }
+
+        function togglePause() {
+            isPaused = !isPaused;
+            document.getElementById('pauseBtn').textContent = isPaused ? 'Resume' : 'Pause';
+            if (!isPaused) animate();
+        }
+
+        function runSimulation() {
+            document.getElementById('pauseBtn').style.display = 'block';
+            document.getElementById('pauseBtn').textContent = 'Pause';
+            isPaused = false;
+            currentIndex = 0;
+            const element = document.getElementById('element').value;
+            let params = {};
+            let engagement = 0;
+            let totalEng = 0;
+            if (element === 'spring' || element === 'dashpot') {
+                params.param = parseFloat(element === 'spring' ? document.getElementById('k').value : document.getElementById('eta').value);
+                params.engagement = parseFloat(document.getElementById('engagement').value);
+                params.rest = parseFloat(document.getElementById('rest').value);
+                engagement = params.engagement;
+            } else if (element === 'spring-parallel') {
+                params.k1 = parseFloat(document.getElementById('k1').value);
+                params.k2 = parseFloat(document.getElementById('k2').value);
+                params.engagement1 = parseFloat(document.getElementById('engagement1').value);
+                params.engagement2 = parseFloat(document.getElementById('engagement2').value);
+                params.rest1 = parseFloat(document.getElementById('rest1').value);
+                params.rest2 = parseFloat(document.getElementById('rest2').value);
+            } else if (element === 'spring-series') {
+                params.k1 = parseFloat(document.getElementById('k1').value);
+                params.k2 = parseFloat(document.getElementById('k2').value);
+                params.rest1 = parseFloat(document.getElementById('rest1').value);
+                params.rest2 = parseFloat(document.getElementById('rest2').value);
+                params.engagement1 = 0;
+                params.engagement2 = 0;
+            } else if (element === 'maxwell' || element === 'kelvin-voigt') {
+                params.k = parseFloat(document.getElementById('k').value);
+                params.eta = parseFloat(document.getElementById('eta').value);
+                params.rest_s = parseFloat(document.getElementById('rest_s').value);
+                params.rest_d = parseFloat(document.getElementById('rest_d').value);
+                params.engagement_s = 0;
+                params.engagement_d = 0;
+            } else if (element === 'sls') {
+                params.k1 = parseFloat(document.getElementById('k1').value);
+                params.k2 = parseFloat(document.getElementById('k2').value);
+                params.eta = parseFloat(document.getElementById('eta').value);
+                params.rest1 = parseFloat(document.getElementById('rest1').value);
+                params.rest2 = parseFloat(document.getElementById('rest2').value);
+                params.rest_d = parseFloat(document.getElementById('rest_d').value);
+                params.engagement1 = 0;
+                params.engagement2 = 0;
+                params.engagement_d = 0;
+            }
+            const inputType = document.getElementById('inputType').value;
+            const waveform = document.getElementById('waveform').value;
+            const inputVal = parseFloat(document.getElementById('inputValue').value);
+            const T = parseFloat(document.getElementById('timeDuration').value);
+            const frequency = waveform === 'sine' ? parseFloat(document.getElementById('frequency').value) : 0;
+
+            const dt = 0.01;
+            times = [];
+            deformations = [];
+            forces = [];
+            internalStates = [];
+            let def = 0;
+            let def1 = 0, def2 = 0, def_s = 0, def_d = 0, def_kv = 0;
+            let vel = 0;
+            let prevDef = 0;
+
+            for (let t = 0; t <= T; t += dt) {
+                times.push(t);
+                const target = getInput(t, waveform, inputVal, T, frequency);
+
+                if (inputType === 'force') {
+                    const force = target;
+                    forces.push(force);
+                    if (element === 'spring') {
+                        def = force > 0 ? engagement + force / params.param : Math.min(def, engagement);
+                        internalStates.push(null);
+                    } else if (element === 'dashpot') {
+                        if (def < engagement && force > 0) def = engagement;
+                        vel = force / params.param;
+                        def += vel * dt;
+                        internalStates.push(null);
+                    } else if (element === 'spring-series') {
+                        const eqK = params.k1 * params.k2 / (params.k1 + params.k2);
+                        def = force > 0 ? force / eqK : 0;
+                        def1 = force / params.k1;
+                        def2 = force / params.k2;
+                        internalStates.push([def1, def2]);
+                    } else if (element === 'spring-parallel') {
+                        let k_eff = 0;
+                        let min_eng = Math.min(params.engagement1, params.engagement2);
+                        let def_assume = min_eng + force / params.k1;
+                        if (def_assume >= params.engagement2) {
+                            k_eff = params.k1 + params.k2;
+                            def = (force + params.k1 * params.engagement1 + params.k2 * params.engagement2) / k_eff;
+                        } else {
+                            k_eff = params.k1;
+                            def = min_eng + force / k_eff;
+                        }
+                        internalStates.push(null);
+                    } else if (element === 'maxwell') {
+                        def_s = force / params.k;
+                        def_d += (force / params.eta) * dt;
+                        def = def_s + def_d;
+                        internalStates.push([def_s, def_d]);
+                    } else if (element === 'kelvin-voigt') {
+                        vel = (force - params.k * def) / params.eta;
+                        def += vel * dt;
+                        internalStates.push(null);
+                    } else if (element === 'sls') {
+                        vel_kv = (force - params.k2 * def_kv) / params.eta;
+                        def_kv += vel_kv * dt;
+                        def1 = force / params.k1;
+                        def = def1 + def_kv;
+                        internalStates.push([def1, def_kv]);
+                    }
+                    deformations.push(def);
+                } else {
+                    def = target;
+                    deformations.push(def);
+                    vel = (def - prevDef) / dt;
+                    prevDef = def;
+                    let force = 0;
+                    if (element === 'spring') {
+                        force = params.param * Math.max(0, def - engagement);
+                        internalStates.push(null);
+                    } else if (element === 'dashpot') {
+                        force = params.param * vel * (def >= engagement ? 1 : 0);
+                        internalStates.push(null);
+                    } else if (element === 'spring-series') {
+                        const eqK = params.k1 * params.k2 / (params.k1 + params.k2);
+                        force = eqK * def;
+                        def1 = force / params.k1;
+                        def2 = force / params.k2;
+                        internalStates.push([def1, def2]);
+                    } else if (element === 'spring-parallel') {
+                        force = params.k1 * Math.max(0, def - params.engagement1) + params.k2 * Math.max(0, def - params.engagement2);
+                        internalStates.push(null);
+                    } else if (element === 'maxwell') {
+                        force = params.k * def_s;
+                        def_d += (force / params.eta) * dt;
+                        def_s = def - def_d;
+                        internalStates.push([def_s, def_d]);
+                    } else if (element === 'kelvin-voigt') {
+                        force = params.k * def + params.eta * vel;
+                        internalStates.push(null);
+                    } else if (element === 'sls') {
+                        def1 = def - def_kv;
+                        force = params.k1 * def1;
+                        vel_kv = (force - params.k2 * def_kv) / params.eta;
+                        def_kv += vel_kv * dt;
+                        internalStates.push([def1, def_kv]);
+                    }
+                    forces.push(force);
+                }
+            }
+
+            // Auto-scale
+            const maxTime = Math.max(...times);
+            const minDef = Math.min(...deformations, 0);
+            const maxDef = Math.max(...deformations, 0) * 1.1;
+            const minForce = Math.min(...forces, 0);
+            const maxForce = Math.max(...forces, 0) * 1.1;
+            const maxY = Math.max(maxDef, maxForce);
+
+            timeChart.options.scales.x.max = maxTime;
+            timeChart.options.scales.y.min = 0;
+            timeChart.options.scales.y.max = maxY;
+            fdChart.options.scales.x.min = 0;
+            fdChart.options.scales.x.max = maxDef;
+            fdChart.options.scales.y.min = 0;
+            fdChart.options.scales.y.max = maxForce;
+
+            // Reset charts
+            timeChart.data.datasets[0].data = [];
+            timeChart.data.datasets[1].data = [];
+            timeChart.update();
+            fdChart.data.datasets[0].data = [];
+            fdChart.update();
+
+            // Animation
+            currentIndex = 0;
+            const animDuration = 5000;
+            const msPerStep = animDuration / times.length;
+
+            animate = function() {
+                if (isPaused || currentIndex >= times.length) {
+                    if (currentIndex >= times.length) document.getElementById('downloadBtn').style.display = 'block';
+                    return;
+                }
+
+                timeChart.data.datasets[0].data = times.slice(0, currentIndex + 1).map((t, j) => ({ x: t, y: deformations[j] }));
+                timeChart.data.datasets[1].data = times.slice(0, currentIndex + 1).map((t, j) => ({ x: t, y: forces[j] }));
+                timeChart.update();
+
+                fdChart.data.datasets[0].data = deformations.slice(0, currentIndex + 1).map((d, j) => ({ x: d, y: forces[j] }));
+                fdChart.update();
+
+                drawModel(element, deformations[currentIndex], forces[currentIndex], inputType, params, internalStates[currentIndex]);
+
+                currentIndex++;
+                animationTimeout = setTimeout(animate, msPerStep);
+            }
+            animate();
+        }
+
+        function downloadCSV() {
+            let csv = 'Time (s),Deformation (mm),Force (N)\n';
+            times.forEach((t, i) => {
+                csv += `${t},${deformations[i]},${forces[i]}\n`;
+            });
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'simulation_data.csv';
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        document.getElementById('element').addEventListener('change', () => { updateParamContainer(); updateLabels(); });
+        document.getElementById('inputType').addEventListener('change', updateLabels);
+        document.getElementById('waveform').addEventListener('change', () => { updateExtraParams(); updateLabels(); });
+        initCharts();
+        updateParamContainer();
+        updateExtraParams();
+        updateLabels();
+    </script>
+</body>
+</html>
